@@ -1,10 +1,8 @@
 const express = require("express");
-const mongoose = require("mongoose");
 const cors = require("cors");
 const helmet = require("helmet");
 const compression = require("compression");
 const rateLimit = require("express-rate-limit");
-const mongoSanitize = require("express-mongo-sanitize");
 const morgan = require("morgan");
 require("dotenv").config();
 
@@ -49,9 +47,6 @@ app.use("/api/auth", authLimiter);
 app.use(express.json({ limit: "10kb" }));
 app.use(express.urlencoded({ extended: true, limit: "10kb" }));
 
-// Sanitize data against NoSQL injection (temporarily disabled for debugging)
-// app.use(mongoSanitize());
-
 // Compression
 app.use(compression());
 
@@ -63,17 +58,13 @@ app.use(compression());
 // }
 
 // ==========================================
-// Database Connection
+// Firebase/Firestore Connection
 // ==========================================
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => logger.info("MongoDB connected successfully"))
-  .catch((err) => {
-    logger.error("MongoDB connection error:", err);
-    process.exit(1);
-  });
+const firebaseConfig = require('./config/firebase');
+firebaseConfig.initializeFirebase();
 
-mongoose.connection.on("error", (err) => logger.error("MongoDB runtime error:", err));
-mongoose.connection.on("disconnected", () => logger.warn("MongoDB disconnected"));
+// Make db available globally for routes (access after initialization)
+app.locals.db = firebaseConfig.db;
 
 // ==========================================
 // API Routes
@@ -88,17 +79,26 @@ app.use("/api/events", require("./routes/events"));
 // ==========================================
 // Health Check
 // ==========================================
-app.get("/health", (req, res) => {
-  const dbState = mongoose.connection.readyState;
-  const dbStatus = { 0: "disconnected", 1: "connected", 2: "connecting", 3: "disconnecting" };
-  res.status(dbState === 1 ? 200 : 503).json({
-    status: dbState === 1 ? "healthy" : "unhealthy",
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    database: dbStatus[dbState] || "unknown",
-    version: require("./package.json").version,
-    environment: process.env.NODE_ENV || "development"
-  });
+app.get("/health", async (req, res) => {
+  try {
+    // Test Firestore connection
+    await firebaseConfig.db.collection('_health').doc('check').set({ lastCheck: new Date() });
+    res.status(200).json({
+      status: "healthy",
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      database: "connected",
+      version: require("./package.json").version,
+      environment: process.env.NODE_ENV || "development"
+    });
+  } catch (error) {
+    res.status(503).json({
+      status: "unhealthy",
+      timestamp: new Date().toISOString(),
+      database: "disconnected",
+      error: error.message
+    });
+  }
 });
 
 app.get("/", (req, res) => {
@@ -121,10 +121,8 @@ app.get("/", (req, res) => {
 // ==========================================
 const gracefulShutdown = (signal) => {
   logger.info(`${signal} received. Shutting down gracefully...`);
-  mongoose.connection.close(false).then(() => {
-    logger.info("MongoDB connection closed");
-    process.exit(0);
-  });
+  logger.info("Firestore connection will close automatically");
+  process.exit(0);
 };
 
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));

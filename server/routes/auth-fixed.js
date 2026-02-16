@@ -1,12 +1,12 @@
 const express = require("express");
 const router = express.Router();
 const jwt = require("jsonwebtoken");
-const User = require("../models/User");
+const UserService = require("../services/userService");
 const logger = require("../utils/logger");
 
 const generateToken = (user) => {
   return jwt.sign(
-    { userId: user._id, role: user.role },
+    { userId: user.id, role: user.role },
     process.env.JWT_SECRET,
     { expiresIn: "7d" }
   );
@@ -26,7 +26,7 @@ router.post("/register", async (req, res) => {
     }
 
     // Check for existing user
-    const existingUser = await User.findOne({ $or: [{ email }, { username }] });
+    const existingUser = await UserService.findByEmailOrUsername(email, username);
     if (existingUser) {
       return res.status(409).json({
         status: "error",
@@ -35,18 +35,16 @@ router.post("/register", async (req, res) => {
     }
 
     // Create new user
-    const user = new User({ 
+    const user = await UserService.create({ 
       username, 
       email, 
       password, 
       fullName, 
       role: role || "Viewer"
     });
-
-    await user.save();
     
     logger.info(`New user registered: ${email} (${user.role})`, { 
-      userId: user._id, 
+      userId: user.id, 
       username,
       role: user.role 
     });
@@ -55,7 +53,7 @@ router.post("/register", async (req, res) => {
       status: "success",
       token: generateToken(user),
       user: {
-        id: user._id,
+        id: user.id,
         username: user.username,
         email: user.email,
         fullName: user.fullName,
@@ -87,8 +85,8 @@ router.post("/login", async (req, res) => {
     }
 
     // Find user
-    const user = await User.findOne({ email });
-    if (!user || !(await user.comparePassword(password))) {
+    const user = await UserService.findByEmail(email);
+    if (!user || !(await UserService.comparePassword(password, user.password))) {
       return res.status(401).json({
         status: "error",
         message: "Invalid credentials"
@@ -96,16 +94,15 @@ router.post("/login", async (req, res) => {
     }
 
     // Update last login
-    user.lastLogin = new Date();
-    await user.save();
+    await UserService.updateLastLogin(user.id);
 
-    logger.info(`User logged in: ${email}`, { userId: user._id });
+    logger.info(`User logged in: ${email}`, { userId: user.id });
 
     res.json({
       status: "success",
       token: generateToken(user),
       user: {
-        id: user._id,
+        id: user.id,
         username: user.username,
         email: user.email,
         fullName: user.fullName,
@@ -137,7 +134,7 @@ router.get("/profile", async (req, res) => {
 
     // Verify token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId);
+    const user = await UserService.findById(decoded.userId);
     
     if (!user) {
       return res.status(401).json({
@@ -149,7 +146,7 @@ router.get("/profile", async (req, res) => {
     res.json({
       status: "success",
       user: {
-        id: user._id,
+        id: user.id,
         username: user.username,
         email: user.email,
         fullName: user.fullName,
@@ -179,7 +176,7 @@ router.put("/profile", async (req, res) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId);
+    const user = await UserService.findById(decoded.userId);
     
     if (!user) {
       return res.status(401).json({
@@ -191,25 +188,26 @@ router.put("/profile", async (req, res) => {
     // Update profile fields
     const { fullName, memberProfile } = req.body;
     
-    if (fullName) user.fullName = fullName;
+    const updates = {};
+    if (fullName) updates.fullName = fullName;
     if (memberProfile && user.role === "Member") {
-      user.memberProfile = { ...user.memberProfile, ...memberProfile };
+      updates.memberProfile = { ...user.memberProfile, ...memberProfile };
     }
 
-    await user.save();
+    const updatedUser = await UserService.update(user.id, updates);
 
-    logger.info(`User profile updated: ${user.email}`, { userId: user._id });
+    logger.info(`User profile updated: ${user.email}`, { userId: user.id });
 
     res.json({
       status: "success",
       message: "Profile updated successfully",
       user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        fullName: user.fullName,
-        role: user.role,
-        memberProfile: user.memberProfile
+        id: updatedUser.id,
+        username: updatedUser.username,
+        email: updatedUser.email,
+        fullName: updatedUser.fullName,
+        role: updatedUser.role,
+        memberProfile: updatedUser.memberProfile
       }
     });
   } catch (error) {

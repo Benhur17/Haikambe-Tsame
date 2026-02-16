@@ -11,6 +11,10 @@ yarn-error.log*
 .env.test.local
 .env.production.local
 
+# Firebase credentials
+serviceAccountKey.json
+*-firebase-adminsdk-*.json
+
 # Production builds
 dist/
 build/

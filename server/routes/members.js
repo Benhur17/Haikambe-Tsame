@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const Member = require("../models/Member");
+const MemberService = require("../services/memberService");
 const { authMiddleware, authorize } = require("../middleware/auth");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { validate, createMemberSchema, updateMemberSchema } = require("../middleware/validate");
@@ -9,40 +9,46 @@ const logger = require("../utils/logger");
 
 // @route   GET /api/members/stats/overview  (must be before /:id)
 router.get("/stats/overview", authMiddleware, asyncHandler(async (req, res) => {
-  const [totalMembers, livingMembers, deceasedMembers, maleCount, femaleCount] = await Promise.all([
-    Member.countDocuments(),
-    Member.countDocuments({ status: "Living" }),
-    Member.countDocuments({ status: "Deceased" }),
-    Member.countDocuments({ gender: "Male" }),
-    Member.countDocuments({ gender: "Female" })
-  ]);
-
+  const stats = await MemberService.getStats();
+  
+  // Calculate age groups for living members
+  const allMembers = await MemberService.findAll({ status: "Living" });
   const currentYear = new Date().getFullYear();
-  const [ageGroups, generations] = await Promise.all([
-    Member.aggregate([
-      { $match: { status: "Living", dateOfBirth: { $exists: true } } },
-      { $project: { age: { $subtract: [currentYear, { $year: "$dateOfBirth" }] } } },
-      { $bucket: { groupBy: "$age", boundaries: [0, 18, 30, 45, 60, 100], default: "Other", output: { count: { $sum: 1 } } } }
-    ]),
-    Member.aggregate([
-      { $group: { _id: "$generation", count: { $sum: 1 } } },
-      { $sort: { _id: 1 } }
-    ])
-  ]);
+  const ageGroups = {
+    "0-18": 0,
+    "18-30": 0,
+    "30-45": 0,
+    "45-60": 0,
+    "60-100": 0
+  };
 
-  res.json({ totalMembers, livingMembers, deceasedMembers, maleCount, femaleCount, ageGroups, generations });
+  allMembers.forEach(member => {
+    if (member.dateOfBirth) {
+      const age = currentYear - new Date(member.dateOfBirth).getFullYear();
+      if (age < 18) ageGroups["0-18"]++;
+      else if (age < 30) ageGroups["18-30"]++;
+      else if (age < 45) ageGroups["30-45"]++;
+      else if (age < 60) ageGroups["45-60"]++;
+      else ageGroups["60-100"]++;
+    }
+  });
+
+  res.json({ 
+    totalMembers: stats.total,
+    livingMembers: stats.living,
+    deceasedMembers: stats.deceased,
+    maleCount: stats.male,
+    femaleCount: stats.female,
+    ageGroups,
+    generations: Object.entries(stats.byGeneration).map(([gen, count]) => ({ _id: parseInt(gen), count }))
+  });
 }));
 
 // @route   GET /api/members/family-tree/:id  (must be before /:id)
 router.get("/family-tree/:id", authMiddleware, asyncHandler(async (req, res) => {
-  const member = await Member.findById(req.params.id)
-    .populate({
-      path: "father mother spouse children",
-      populate: { path: "father mother spouse children" }
-    });
-
-  if (!member) throw new NotFoundError("Member");
-  res.json(member);
+  const family = await MemberService.getFamily(req.params.id);
+  if (!family) throw new NotFoundError("Member");
+  res.json(family);
 }));
 
 // @route   GET /api/members
@@ -51,77 +57,114 @@ router.get("/", authMiddleware, asyncHandler(async (req, res) => {
   const pageNum = Math.max(1, parseInt(page));
   const limitNum = Math.min(100, Math.max(1, parseInt(limit)));
 
-  const query = {};
-  if (search) query.$text = { $search: search };
-  if (status) query.status = status;
-  if (generation) query.generation = parseInt(generation);
+  let members;
+  
+  if (search) {
+    members = await MemberService.searchByName(search);
+  } else {
+    const filters = {};
+    if (status) filters.status = status;
+    if (generation) filters.generation = generation;
+    members = await MemberService.findAll(filters);
+  }
 
-  const [members, total] = await Promise.all([
-    Member.find(query)
-      .populate("father mother spouse children")
-      .limit(limitNum)
-      .skip((pageNum - 1) * limitNum)
-      .sort({ createdAt: -1 })
-      .lean(),
-    Member.countDocuments(query)
-  ]);
+  // Apply pagination
+  const total = members.length;
+  const paginatedMembers = members.slice((pageNum - 1) * limitNum, pageNum * limitNum);
 
   res.json({
-    members,
+    members: paginatedMembers,
     pagination: { total, page: pageNum, pages: Math.ceil(total / limitNum) }
   });
 }));
 
 // @route   GET /api/members/:id
 router.get("/:id", authMiddleware, asyncHandler(async (req, res) => {
-  const member = await Member.findById(req.params.id)
-    .populate("father mother spouse children siblings createdBy");
+  const member = await MemberService.findById(req.params.id);
   if (!member) throw new NotFoundError("Member");
   res.json(member);
 }));
 
 // @route   POST /api/members
 router.post("/", authMiddleware, authorize("Super Admin", "Clan Admin", "Editor"), validate(createMemberSchema), asyncHandler(async (req, res) => {
-  const member = new Member({ ...req.body, createdBy: req.user._id });
-  await member.save();
+  const member = await MemberService.create({ ...req.body, createdBy: req.user.userId });
 
-  // Update parent's children arrays
-  const parentUpdates = [];
-  if (member.father) parentUpdates.push(Member.findByIdAndUpdate(member.father, { $addToSet: { children: member._id } }));
-  if (member.mother) parentUpdates.push(Member.findByIdAndUpdate(member.mother, { $addToSet: { children: member._id } }));
-  if (parentUpdates.length) await Promise.all(parentUpdates);
+  // Update parent's children arrays if needed
+  if (member.father) {
+    const father = await MemberService.findById(member.father);
+    const fatherChildren = father.children || [];
+    if (!fatherChildren.includes(member.id)) {
+      await MemberService.update(member.father, { children: [...fatherChildren, member.id] });
+    }
+  }
+  if (member.mother) {
+    const mother = await MemberService.findById(member.mother);
+    const motherChildren = mother.children || [];
+    if (!motherChildren.includes(member.id)) {
+      await MemberService.update(member.mother, { children: [...motherChildren, member.id] });
+    }
+  }
 
-  logger.info(`Member created: ${member.fullName} by user ${req.user._id}`);
+  logger.info(`Member created: ${member.fullName} by user ${req.user.userId}`);
   res.status(201).json(member);
 }));
 
 // @route   PUT /api/members/:id
 router.put("/:id", authMiddleware, authorize("Super Admin", "Clan Admin", "Editor"), validate(updateMemberSchema), asyncHandler(async (req, res) => {
-  const member = await Member.findByIdAndUpdate(
-    req.params.id,
-    req.body,
-    { new: true, runValidators: true }
-  );
+  const member = await MemberService.update(req.params.id, req.body);
   if (!member) throw new NotFoundError("Member");
   res.json(member);
 }));
 
 // @route   DELETE /api/members/:id
 router.delete("/:id", authMiddleware, authorize("Super Admin", "Clan Admin"), asyncHandler(async (req, res) => {
-  const member = await Member.findById(req.params.id);
+  const member = await MemberService.findById(req.params.id);
   if (!member) throw new NotFoundError("Member");
 
   // Clean up all references to this member
-  await Promise.all([
-    Member.updateMany({ children: member._id }, { $pull: { children: member._id } }),
-    Member.updateMany({ spouse: member._id }, { $pull: { spouse: member._id } }),
-    Member.updateMany({ siblings: member._id }, { $pull: { siblings: member._id } }),
-    Member.updateMany({ father: member._id }, { $unset: { father: "" } }),
-    Member.updateMany({ mother: member._id }, { $unset: { mother: "" } })
-  ]);
+  const allMembers = await MemberService.findAll();
+  
+  for (const m of allMembers) {
+    let needsUpdate = false;
+    const updates = {};
 
-  await Member.findByIdAndDelete(member._id);
-  logger.info(`Member deleted: ${member.fullName} by user ${req.user._id}`);
+    // Remove from children arrays
+    if (m.children && m.children.includes(member.id)) {
+      updates.children = m.children.filter(id => id !== member.id);
+      needsUpdate = true;
+    }
+
+    // Remove from spouse arrays
+    if (m.spouse && m.spouse.includes(member.id)) {
+      updates.spouse = m.spouse.filter(id => id !== member.id);
+      needsUpdate = true;
+    }
+
+    // Remove from siblings arrays
+    if (m.siblings && m.siblings.includes(member.id)) {
+      updates.siblings = m.siblings.filter(id => id !== member.id);
+      needsUpdate = true;
+    }
+
+    // Remove father reference
+    if (m.father === member.id) {
+      updates.father = null;
+      needsUpdate = true;
+    }
+
+    // Remove mother reference
+    if (m.mother === member.id) {
+      updates.mother = null;
+      needsUpdate = true;
+    }
+
+    if (needsUpdate) {
+      await MemberService.update(m.id, updates);
+    }
+  }
+
+  await MemberService.delete(member.id);
+  logger.info(`Member deleted: ${member.fullName} by user ${req.user.userId}`);
   res.json({ message: "Member deleted successfully" });
 }));
 

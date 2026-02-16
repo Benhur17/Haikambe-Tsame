@@ -1,5 +1,5 @@
 const jwt = require("jsonwebtoken");
-const User = require("../models/User");
+const UserService = require("../services/userService");
 const { UnauthorizedError, ForbiddenError } = require("../utils/errors");
 const logger = require("../utils/logger");
 
@@ -15,7 +15,7 @@ const authMiddleware = async (req, res, next) => {
 
     const token = authHeader.replace("Bearer ", "");
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select("-password");
+    const user = await UserService.findById(decoded.userId);
 
     if (!user) {
       throw new UnauthorizedError("User account not found");
@@ -25,6 +25,8 @@ const authMiddleware = async (req, res, next) => {
       throw new UnauthorizedError("Account has been deactivated");
     }
 
+    // Remove password from user object
+    delete user.password;
     req.user = user;
     next();
   } catch (error) {
@@ -44,7 +46,7 @@ const authorize = (...roles) => {
       return next(new UnauthorizedError("Authentication required"));
     }
     if (!roles.includes(req.user.role)) {
-      logger.warn(`Access denied for user ${req.user._id} (${req.user.role}) on ${req.method} ${req.originalUrl}`);
+      logger.warn(`Access denied for user ${req.user.id} (${req.user.role}) on ${req.method} ${req.originalUrl}`);
       return next(new ForbiddenError());
     }
     next();
